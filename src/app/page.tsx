@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+type ConnectionStatus = "connecting" | "open" | "closed" | "error";
+
 type MessageSender = "local" | "remote";
 
 type ChatMessage = {
@@ -11,261 +13,250 @@ type ChatMessage = {
   timestamp: number;
 };
 
-const rtcConfig: RTCConfiguration = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+type WelcomeMessage = {
+  type: "welcome";
+  clientId: string;
 };
+
+type ChatServerMessage = {
+  type: "chat";
+  clientId: string;
+  text: string;
+  messageId?: string;
+  timestamp?: number;
+};
+
+type ServerMessage = WelcomeMessage | ChatServerMessage;
+
+const DEFAULT_SIGNALING_ORIGIN = "http://localhost:3001";
 
 const makeId = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2);
 
-export default function Home() {
-  const peerRef = useRef<RTCPeerConnection | null>(null);
-  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+const resolveWebSocketUrl = (value: string) => {
+  if (!value) {
+    return "";
+  }
 
-  const [localDescription, setLocalDescription] = useState("");
-  const [remoteDescriptionInput, setRemoteDescriptionInput] = useState("");
-  const [connectionState, setConnectionState] = useState<RTCPeerConnectionState>("new");
-  const [iceState, setIceState] = useState<RTCIceConnectionState>("new");
-  const [channelState, setChannelState] = useState<RTCDataChannelState>("closed");
+  try {
+    const url = new URL(value);
+
+    if (url.protocol === "http:") {
+      url.protocol = "ws:";
+    } else if (url.protocol === "https:") {
+      url.protocol = "wss:";
+    }
+
+    if (!url.pathname || url.pathname === "/") {
+      url.pathname = "/ws";
+    }
+
+    return url.toString();
+  } catch {
+    return value;
+  }
+};
+
+const resolveSignalDisplay = (value: string) => {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return value;
+  }
+};
+
+const SIGNALING_URL =
+  resolveWebSocketUrl(process.env.NEXT_PUBLIC_SIGNALING_ORIGIN ?? DEFAULT_SIGNALING_ORIGIN) ||
+  resolveWebSocketUrl(DEFAULT_SIGNALING_ORIGIN);
+
+const SIGNALING_DISPLAY = resolveSignalDisplay(
+  process.env.NEXT_PUBLIC_SIGNALING_ORIGIN ?? DEFAULT_SIGNALING_ORIGIN
+);
+
+export default function Home() {
+  const socketRef = useRef<WebSocket | null>(null);
+  const clientIdRef = useRef<string | null>(null);
+  const seenMessageIdsRef = useRef<Set<string>>(new Set());
+
+  const [clientId, setClientId] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draftMessage, setDraftMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
-
-  const syncLocalDescription = useCallback(() => {
-    const description = peerRef.current?.localDescription;
-    setLocalDescription(description ? JSON.stringify(description) : "");
-  }, []);
-
-  const pushMessage = useCallback((sender: MessageSender, text: string) => {
-    setMessages((prev) => [...prev, { id: makeId(), sender, text, timestamp: Date.now() }]);
-  }, []);
-
-  const attachDataChannel = useCallback(
-    (channel: RTCDataChannel) => {
-      dataChannelRef.current = channel;
-      setChannelState(channel.readyState);
-
-      channel.onclose = () => setChannelState(channel.readyState);
-      channel.onopen = () => {
-        setChannelState(channel.readyState);
-        setNoticeMessage("Data channel is ready. Start chatting!");
-      };
-      channel.onmessage = (event) => {
-        const incoming = typeof event.data === "string" ? event.data : JSON.stringify(event.data);
-        pushMessage("remote", incoming);
-      };
-      channel.onerror = () => {
-        setErrorMessage("Data channel error. Try restarting the session.");
-      };
-    },
-    [pushMessage]
+  const [noticeMessage, setNoticeMessage] = useState<string | null>(
+    "Connecting to the signaling service..."
   );
 
   useEffect(() => {
-    const peer = new RTCPeerConnection(rtcConfig);
-    peerRef.current = peer;
+    clientIdRef.current = clientId;
+  }, [clientId]);
 
-    peer.onicecandidate = () => {
-      syncLocalDescription();
-    };
-    peer.oniceconnectionstatechange = () => {
-      setIceState(peer.iceConnectionState);
-    };
-    peer.onconnectionstatechange = () => {
-      setConnectionState(peer.connectionState);
-    };
-    peer.ondatachannel = (event) => {
-      attachDataChannel(event.channel);
-    };
+  useEffect(() => {
+    const url = SIGNALING_URL;
 
-    setConnectionState(peer.connectionState);
-    setIceState(peer.iceConnectionState);
+    if (!url) {
+      setConnectionStatus("error");
+      setErrorMessage("Signaling URL is not configured.");
+      return undefined;
+    }
+
+    setConnectionStatus("connecting");
+    setNoticeMessage("Connecting to the signaling service...");
+    setErrorMessage(null);
+
+    const socket = new WebSocket(url);
+    const nextSeenMessageIds = new Set<string>();
+    seenMessageIdsRef.current = nextSeenMessageIds;
+
+    socketRef.current = socket;
+
+    socket.addEventListener("open", () => {
+      if (socketRef.current !== socket) {
+        return;
+      }
+      setConnectionStatus("open");
+      setNoticeMessage("Connected to the signaling service.");
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (socketRef.current !== socket) {
+        return;
+      }
+      let payload: ServerMessage | null = null;
+
+      try {
+        payload = JSON.parse(typeof event.data === "string" ? event.data : String(event.data));
+      } catch (error) {
+        console.warn("Discarding malformed signaling payload", error);
+        return;
+      }
+
+      if (!payload || typeof payload !== "object" || typeof payload.type !== "string") {
+        return;
+      }
+
+      if (payload.type === "welcome") {
+        if (typeof payload.clientId === "string") {
+          clientIdRef.current = payload.clientId;
+          setClientId(payload.clientId);
+          setNoticeMessage("You're ready to exchange messages through the signaling server.");
+        }
+        return;
+      }
+
+      if (payload.type === "chat") {
+        if (typeof payload.text !== "string" || typeof payload.clientId !== "string") {
+          return;
+        }
+
+        const messageId = typeof payload.messageId === "string" ? payload.messageId : makeId();
+        if (seenMessageIdsRef.current.has(messageId)) {
+          return;
+        }
+        seenMessageIdsRef.current.add(messageId);
+
+        const timestamp = typeof payload.timestamp === "number" ? payload.timestamp : Date.now();
+
+        const sender: MessageSender = payload.clientId === clientIdRef.current ? "local" : "remote";
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: messageId,
+            sender,
+            text: payload.text,
+            timestamp,
+          },
+        ]);
+      }
+    });
+
+    socket.addEventListener("error", (event) => {
+      if (socketRef.current !== socket) {
+        return;
+      }
+      console.error("Signaling socket error", event);
+      setConnectionStatus("error");
+      setErrorMessage("The signaling connection encountered an error. Try reconnecting.");
+    });
+
+    socket.addEventListener("close", (event) => {
+      if (socketRef.current !== socket) {
+        return;
+      }
+      const reason =
+        event.code === 1000 ? "Connection closed gracefully." : "Connection closed unexpectedly.";
+      setConnectionStatus("closed");
+      setNoticeMessage(reason);
+    });
 
     return () => {
-      dataChannelRef.current?.close();
-      peer.close();
-      peerRef.current = null;
+      socketRef.current = null;
+      socket.close();
     };
-  }, [attachDataChannel, syncLocalDescription]);
-
-  const ensurePeer = () => {
-    if (!peerRef.current) {
-      throw new Error("Peer connection is not ready yet. Refresh the page and try again.");
-    }
-    return peerRef.current;
-  };
-
-  const createOffer = useCallback(async () => {
-    setErrorMessage(null);
-    setNoticeMessage(null);
-
-    try {
-      const peer = ensurePeer();
-      if (!dataChannelRef.current || dataChannelRef.current.readyState === "closed") {
-        const channel = peer.createDataChannel("chat");
-        attachDataChannel(channel);
-      }
-
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      syncLocalDescription();
-      setNoticeMessage("Offer prepared. Share it with your peer.");
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to create offer.");
-    }
-  }, [attachDataChannel, syncLocalDescription]);
-
-  const applyRemoteDescription = useCallback(async () => {
-    setErrorMessage(null);
-    setNoticeMessage(null);
-
-    try {
-      const peer = ensurePeer();
-      if (!remoteDescriptionInput.trim()) {
-        throw new Error("Paste the SDP blob you received before applying it.");
-      }
-
-      const remoteDescription = JSON.parse(remoteDescriptionInput) as RTCSessionDescriptionInit;
-      if (!remoteDescription.type) {
-        throw new Error("Invalid SDP message. Confirm you copied the entire text.");
-      }
-
-      await peer.setRemoteDescription(remoteDescription);
-
-      if (remoteDescription.type === "offer") {
-        const answer = await peer.createAnswer();
-        await peer.setLocalDescription(answer);
-        syncLocalDescription();
-        setNoticeMessage("Answer ready. Send it back to the caller.");
-      } else {
-        setNoticeMessage("Remote description applied. Waiting for data channel.");
-      }
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Unable to apply the remote description."
-      );
-    }
-  }, [remoteDescriptionInput, syncLocalDescription]);
+  }, [connectionAttempt]);
 
   const sendMessage = useCallback(() => {
-    setErrorMessage(null);
-
-    const channel = dataChannelRef.current;
     const trimmed = draftMessage.trim();
-
-    if (!channel || channel.readyState !== "open") {
-      setErrorMessage("Channel not ready. Confirm both peers exchanged offer/answer.");
-      return;
-    }
-
     if (!trimmed) {
       return;
     }
 
-    channel.send(trimmed);
-    pushMessage("local", trimmed);
-    setDraftMessage("");
-  }, [draftMessage, pushMessage]);
-
-  const copyLocalDescription = useCallback(async () => {
-    setErrorMessage(null);
-    setNoticeMessage(null);
-
-    if (!localDescription) {
-      setErrorMessage("Nothing to copy yet. Create an offer or answer first.");
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setErrorMessage("Cannot send: signaling connection is not open.");
       return;
     }
 
     try {
-      await navigator.clipboard.writeText(localDescription);
-      setNoticeMessage("Local description copied to clipboard.");
+      socket.send(JSON.stringify({ type: "chat", text: trimmed }));
+      setDraftMessage("");
+      setErrorMessage(null);
     } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Clipboard copy failed. Copy manually instead."
-      );
+      console.error("Failed to send message", error);
+      setErrorMessage("Failed to send message. Try again.");
     }
-  }, [localDescription]);
+  }, [draftMessage]);
+
+  const reconnect = useCallback(() => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.close();
+    }
+    setConnectionAttempt((value) => value + 1);
+  }, []);
 
   return (
     <div className="mx-auto flex min-h-screen max-w-4xl flex-col gap-8 px-4 py-10 sm:px-8">
       <header className="flex flex-col gap-2">
         <h1 className="text-3xl font-semibold text-zinc-900 dark:text-zinc-50">
-          WebRTC P2P Chat Proof-of-Concept
+          Werewolf Signaling Chat Proof-of-Concept
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
-          Exchange the session description (SDP) blobs with another browser window to establish a
-          peer-to-peer data channel. Once connected, you can exchange chat messages without a relay
-          server.
+          Messages now travel through the dedicated signaling service hosted on Render. Use this
+          page to verify connectivity before layering on the full Werewolf game flow.
         </p>
       </header>
-
-      <section className="grid gap-6 rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-        <div className="grid gap-2">
-          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">
-            Step 1: Create or join
-          </h2>
-          <p className="text-sm text-zinc-600 dark:text-zinc-300">
-            The caller clicks <span className="font-medium">Create offer</span> and shares the
-            generated blob. The callee pastes the offer below and clicks
-            <span className="font-medium"> Apply remote description</span> to produce an answer.
-          </p>
-          <div className="flex flex-wrap gap-3">
-            <button
-              type="button"
-              onClick={createOffer}
-              className="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
-            >
-              Create offer
-            </button>
-            <button
-              type="button"
-              onClick={copyLocalDescription}
-              className="inline-flex items-center justify-center rounded-md border border-indigo-600 px-4 py-2 text-sm font-medium text-indigo-600 transition hover:bg-indigo-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 dark:hover:bg-indigo-900/20"
-            >
-              Copy local description
-            </button>
-          </div>
-        </div>
-
-        <label className="grid gap-2 text-sm text-zinc-700 dark:text-zinc-200">
-          Remote description (paste offer or answer)
-          <textarea
-            value={remoteDescriptionInput}
-            onChange={(event) => setRemoteDescriptionInput(event.target.value)}
-            className="min-h-[96px] w-full rounded-md border border-zinc-300 bg-white px-3 py-2 font-mono text-xs text-zinc-800 shadow-sm outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
-            placeholder="Paste the remote SDP blob here"
-          />
-        </label>
-
-        <button
-          type="button"
-          onClick={applyRemoteDescription}
-          className="inline-flex w-fit items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-emerald-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
-        >
-          Apply remote description
-        </button>
-
-        <label className="grid gap-2 text-sm text-zinc-700 dark:text-zinc-200">
-          Local description (share this with your peer)
-          <textarea
-            value={localDescription}
-            onChange={(event) => setLocalDescription(event.target.value)}
-            className="min-h-[120px] w-full rounded-md border border-zinc-300 bg-zinc-50 px-3 py-2 font-mono text-xs text-zinc-800 shadow-inner outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-            placeholder="Create an offer or answer to populate this field"
-          />
-        </label>
-      </section>
 
       <section className="grid gap-4 rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
         <div className="flex flex-wrap items-center gap-4 text-sm text-zinc-600 dark:text-zinc-300">
           <span className="font-medium text-zinc-900 dark:text-zinc-100">
-            Connection: {connectionState}
+            Connection: {connectionStatus}
           </span>
-          <span>ICE: {iceState}</span>
-          <span>Channel: {channelState}</span>
+          <span>Client ID: {clientId ?? "–"}</span>
+          <span>Endpoint: {SIGNALING_DISPLAY}</span>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={reconnect}
+            className="inline-flex items-center justify-center rounded-md border border-indigo-600 px-4 py-2 text-sm font-medium text-indigo-600 transition hover:bg-indigo-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 dark:hover:bg-indigo-900/20"
+          >
+            Reconnect
+          </button>
         </div>
 
         {errorMessage ? (
@@ -279,19 +270,23 @@ export default function Home() {
             {noticeMessage}
           </p>
         ) : null}
+      </section>
 
+      <section className="grid gap-4 rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
         <div className="grid gap-3">
           <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Chat</h2>
           <div className="grid max-h-72 gap-2 overflow-y-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-700 dark:bg-zinc-950">
             {messages.length === 0 ? (
               <p className="text-zinc-500 dark:text-zinc-400">
-                No messages yet. Establish the connection to start chatting.
+                No messages yet. Connect a second browser session to the signaling service to start
+                chatting.
               </p>
             ) : (
               messages.map((message) => (
                 <div key={message.id} className="flex flex-col gap-0.5">
                   <span className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-                    {message.sender === "local" ? "You" : "Peer"}
+                    {message.sender === "local" ? "You" : "Peer"} ·{" "}
+                    {new Date(message.timestamp).toLocaleTimeString()}
                   </span>
                   <p className="rounded-md bg-white px-3 py-2 text-zinc-800 shadow-sm dark:bg-zinc-900 dark:text-zinc-100">
                     {message.text}
@@ -326,9 +321,8 @@ export default function Home() {
 
       <footer className="border-t border-dashed border-zinc-200 pt-4 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
         <p>
-          This page mirrors the reference signaling flow: peers share SDP blobs manually instead of
-          relying on a dedicated signaling service. Replace the manual exchange with a websocket
-          gateway (see sample/signaling.gateway.ts) once the backend lands.
+          This proof-of-concept relays chat messages through the Werewolf signaling service. Expand
+          the protocol to negotiate WebRTC sessions once the signaling contracts stabilize.
         </p>
       </footer>
     </div>
