@@ -35,3 +35,11 @@
 - Keep commit subjects concise, present-tense, and imperative (`setup lobby grid`, `tune tailwind theme`).
 - Group related changes per commit; mention affected areas when helpful (`app/page.tsx`, `globals.css`).
 - For PRs, provide a clear summary, before/after screenshots for UI tweaks, reproduction steps, and any follow-up TODOs. Confirm `npm run build` and `npm run lint` complete cleanly before requesting review.
+
+## Project Direction
+
+- デプロイ先は常に Vercel を想定し、SSR 動作を前提に実装と検証を行う。
+- 設計資料は `doc/` 以下に集約し、WebRTC/リアルタイム関連の更新も同ディレクトリで管理する。
+- Next.js や依存ライブラリは最新安定版へ追従し、不要ファイルやレガシーパターンを持ち込まないようコードベースをクリーンに保つ。
+- リアルタイム通信の主な仕様やアーキテクチャ判断は `doc/architecture.md` に記録し、変更時は同ドキュメントを更新する。
+- サンプル実装として `sample/` 以下を参照する
