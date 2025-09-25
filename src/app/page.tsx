@@ -1,7 +1,7 @@
 "use client";
 
-import { WerewolfChatPrototype } from "@/lib/chat/WerewolfChatPrototype";
+import { HostRoomCreationPanel } from "@/lib/room/components/HostRoomCreationPanel";
 
 export default function Home() {
-  return <WerewolfChatPrototype />;
+  return <HostRoomCreationPanel />;
 }
