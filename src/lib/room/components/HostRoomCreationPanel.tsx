@@ -1,36 +1,23 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoom, type CreateRoomResponse } from "@/lib/room/api";
+import {
+  makeGuestInviteUrl,
+  makeHostControlUrl,
+  setStoredHostRoom,
+} from "@/lib/room/utils";
 
 type Status = "idle" | "pending" | "success" | "error";
-
-const makeGuestInviteUrl = (origin: string, roomId: string) => {
-  if (!origin) {
-    return `/rooms/join?roomId=${roomId}`;
-  }
-
-  const url = new URL(`/rooms/join`, origin);
-  url.searchParams.set("roomId", roomId);
-  return url.toString();
-};
-
-const makeHostControlUrl = (origin: string, room: CreateRoomResponse) => {
-  if (!origin) {
-    return `/rooms/${room.roomId}?hostToken=${room.hostToken}`;
-  }
-
-  const url = new URL(`/rooms/${room.roomId}`, origin);
-  url.searchParams.set("hostToken", room.hostToken);
-  return url.toString();
-};
 
 export const HostRoomCreationPanel = () => {
   const [status, setStatus] = useState<Status>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [room, setRoom] = useState<CreateRoomResponse | null>(null);
   const [origin, setOrigin] = useState<string>("");
+  const router = useRouter();
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -38,33 +25,27 @@ export const HostRoomCreationPanel = () => {
     }
   }, []);
 
-  useEffect(() => {
-    if (!room || typeof window === "undefined") {
-      return;
-    }
-
-    window.localStorage.setItem(
-      `werewolf:host:${room.roomId}`,
-      JSON.stringify({
-        token: room.hostToken,
-        createdAt: room.createdAt,
-      })
-    );
-  }, [room]);
-
   const handleCreateRoom = useCallback(async () => {
     setStatus("pending");
     setErrorMessage(null);
 
     try {
       const created = await createRoom();
+      setStoredHostRoom(created.roomId, {
+        token: created.hostToken,
+        createdAt: created.createdAt,
+      });
       setRoom(created);
       setStatus("success");
+
+      router.push(
+        `/rooms/${encodeURIComponent(created.roomId)}?hostToken=${encodeURIComponent(created.hostToken)}`
+      );
     } catch (error) {
       setStatus("error");
       setErrorMessage(error instanceof Error ? error.message : "不明なエラーが発生しました");
     }
-  }, []);
+  }, [router]);
 
   const guestInviteUrl = useMemo(() => {
     if (!room) {
@@ -79,7 +60,7 @@ export const HostRoomCreationPanel = () => {
       return "";
     }
 
-    return makeHostControlUrl(origin, room);
+    return makeHostControlUrl(origin, room.roomId, room.hostToken);
   }, [origin, room]);
 
   return (
